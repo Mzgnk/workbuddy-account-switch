@@ -7,6 +7,7 @@
 #   (无参数)              交互菜单
 #   -Action runjob        读取并执行 pending-job.json
 #   -Action switch -Name X / -Action save -Name X   非交互执行
+#   -Action sync / synccheck                        修复/检查会话归属(互通)
 #   -Action list / accounts / selftest              只读查询
 # ============================================================
 param(
@@ -56,6 +57,7 @@ function Save-Profile([string]$Name) {
     Write-Log "SAVE OK [$Name] (menu) account=$($acc.Nick)"
     Write-Host ""
     Write-Host "  [OK] 已保存档案 [$Name]  账号: $($acc.Nick)" -ForegroundColor Green
+    Sync-SessionAfterProfileChange -Uid $acc.Uid -Stage "SAVE"
     $a = Read-Host "  现在重新启动 WorkBuddy? (Y/n)"
     if ($a -ne "n" -and $a -ne "N") { Start-WorkBuddy | Out-Null }
 }
@@ -115,6 +117,8 @@ function Switch-Profile([string]$Name) {
     Write-Log "SWITCH OK -> [$Name] ($nick) (menu)"
     Write-Host ""
     Write-Host "  [OK] 切换完成! 启动后应显示账号: $nick" -ForegroundColor Green
+    $muid = if ($meta) { $meta.uid } else { "" }
+    Sync-SessionAfterProfileChange -Uid $muid -Stage "SWITCH"
     $a = Read-Host "  现在启动 WorkBuddy? (Y/n)"
     if ($a -ne "n" -and $a -ne "N") { Start-WorkBuddy | Out-Null }
 }
@@ -169,8 +173,9 @@ function Show-Menu {
         Write-Host "   2. 切换账号"
         Write-Host "   3. 查看账号/档案列表"
         Write-Host "   4. 删除档案"
-        Write-Host "   5. 退出"
-        $c = Read-Host "  请选择 (1-5)"
+        Write-Host "   5. 同步会话历史 (新账号看不到老会话时用)"
+        Write-Host "   6. 退出"
+        $c = Read-Host "  请选择 (1-6)"
         switch ($c) {
             "1" {
                 $n = Clean-Name (Read-Host "  档案名称 (比如: 主号 / 工作号)")
@@ -200,8 +205,9 @@ function Show-Menu {
                     Remove-Profile $list[[int]$k - 1].Name
                 }
             }
-            "5" { break }
-            default { Write-Host "  请输入 1-5。" -ForegroundColor Red }
+            "5" { [void](Invoke-AutoSync) }
+            "6" { break }
+            default { Write-Host "  请输入 1-6。" -ForegroundColor Red }
         }
     }
 }
@@ -218,6 +224,8 @@ switch ($Action) {
     "doctor"   { Invoke-Doctor }
     "verify"   { [void](Invoke-Verify) }
     "runjob"   { [void](Invoke-RunJob) }
+    "sync"     { if (-not (Invoke-AutoSync)) { exit 1 } }
+    "synccheck" { if (-not (Invoke-AutoSync -CheckOnly)) { exit 1 } }
     "switch"   {
         if (-not $Name) { Write-Host "用法: -Action switch -Name <档案名>"; exit 1 }
         if ($DelaySeconds -gt 0) { Start-Sleep -Seconds $DelaySeconds }

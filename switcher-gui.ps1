@@ -17,7 +17,7 @@ $font = New-Object System.Drawing.Font("Microsoft YaHei", 9)
 # ---------- 窗体 ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "WorkBuddy 账号切换"
-$form.ClientSize = New-Object System.Drawing.Size(440, 400)
+$form.ClientSize = New-Object System.Drawing.Size(440, 436)
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
 $form.StartPosition = "CenterScreen"
@@ -44,7 +44,7 @@ $lv.FullRowSelect = $true
 $lv.MultiSelect = $false
 $lv.HideSelection = $false
 $lv.Location = New-Object System.Drawing.Point(12, 62)
-$lv.Size = New-Object System.Drawing.Size(416, 240)
+$lv.Size = New-Object System.Drawing.Size(416, 228)
 [void]$lv.Columns.Add("账号", 150)
 [void]$lv.Columns.Add("状态", 110)
 [void]$lv.Columns.Add("档案", 90)
@@ -54,25 +54,39 @@ $form.Controls.Add($lv)
 # ---------- 按钮 ----------
 $btnSwitch = New-Object System.Windows.Forms.Button
 $btnSwitch.Text = "切换到选中账号"
-$btnSwitch.Location = New-Object System.Drawing.Point(12, 312)
-$btnSwitch.Size = New-Object System.Drawing.Size(130, 32)
+$btnSwitch.Location = New-Object System.Drawing.Point(12, 298)
+$btnSwitch.Size = New-Object System.Drawing.Size(130, 30)
 $form.Controls.Add($btnSwitch)
 
 $btnSave = New-Object System.Windows.Forms.Button
 $btnSave.Text = "保存当前登录..."
-$btnSave.Location = New-Object System.Drawing.Point(154, 312)
-$btnSave.Size = New-Object System.Drawing.Size(130, 32)
+$btnSave.Location = New-Object System.Drawing.Point(154, 298)
+$btnSave.Size = New-Object System.Drawing.Size(130, 30)
 $form.Controls.Add($btnSave)
 
 $btnRefresh = New-Object System.Windows.Forms.Button
 $btnRefresh.Text = "刷新"
-$btnRefresh.Location = New-Object System.Drawing.Point(296, 312)
-$btnRefresh.Size = New-Object System.Drawing.Size(132, 32)
+$btnRefresh.Location = New-Object System.Drawing.Point(296, 298)
+$btnRefresh.Size = New-Object System.Drawing.Size(132, 30)
 $form.Controls.Add($btnRefresh)
+
+$btnSync = New-Object System.Windows.Forms.Button
+$btnSync.Text = "同步会话历史 (新账号看不到老会话时点这里)"
+$btnSync.Location = New-Object System.Drawing.Point(12, 334)
+$btnSync.Size = New-Object System.Drawing.Size(416, 30)
+$btnSync.Enabled = $false
+$form.Controls.Add($btnSync)
+
+# ---------- 会话归属状态 ----------
+$lblSession = New-Object System.Windows.Forms.Label
+$lblSession.Location = New-Object System.Drawing.Point(12, 370)
+$lblSession.Size = New-Object System.Drawing.Size(416, 18)
+$lblSession.ForeColor = [System.Drawing.Color]::DimGray
+$form.Controls.Add($lblSession)
 
 # ---------- 状态栏 ----------
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(12, 356)
+$lblStatus.Location = New-Object System.Drawing.Point(12, 392)
 $lblStatus.Size = New-Object System.Drawing.Size(416, 36)
 $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
 $form.Controls.Add($lblStatus)
@@ -164,22 +178,81 @@ function Do-Save {
     $ok = $false
     try { $ok = Invoke-AutoSave $n } catch { Set-Status "保存出错: $_" $true; $btnSwitch.Enabled = $true; $btnSave.Enabled = $true; return }
     if ($ok) {
-        Set-Status "已保存档案 [$n] (账号: $($acc.Nick))。以后在列表里点它就能一键切换。"
+        Set-Status "已保存档案 [$n] (账号: $($acc.Nick)), 会话历史已同步。以后点它就能一键切换。"
         Refresh-List
+        Update-SessionHealth
     } else {
         Set-Status "保存失败: $(Get-LastLogLine)" $true
     }
     $btnSwitch.Enabled = $true; $btnSave.Enabled = $true
 }
 
+# ---------- 会话归属状态 ----------
+function Update-SessionHealth {
+    $btnSync.Enabled = $false
+    $lblSession.Text = "会话归属: 检查中 ..."
+    $lblSession.ForeColor = [System.Drawing.Color]::DimGray
+    [System.Windows.Forms.Application]::DoEvents()
+    $acc = Get-LiveAccount
+    if (-not $acc) { $lblSession.Text = "会话归属: 未知 (未读取到登录账号)"; return }
+    if (-not $ShareConversations) {
+        $lblSession.Text = "会话互通: 已关闭 (各账号各自独立)"
+        return
+    }
+    $ck = $null
+    try { $ck = Merge-SessionOwners $acc.Uid -Check } catch {}
+    if (-not $ck -or -not $ck.Ok) {
+        $rc = if ($ck) { $ck.Reason } else { "error" }
+        $lblSession.Text = "会话归属: 无法检查 ($rc) —— 不影响切换"
+        return
+    }
+    if ($ck.Moved -gt 0) {
+        $lblSession.Text = "会话归属: [!] 有 $($ck.Moved) 条属于别的账号, 当前账号看不到 → 点下面按钮同步"
+        $lblSession.ForeColor = [System.Drawing.Color]::Firebrick
+        $btnSync.Enabled = $true
+    } else {
+        $lblSession.Text = "会话归属: 正常 (当前账号名下 $($ck.Total) 条)"
+        $lblSession.ForeColor = [System.Drawing.Color]::SeaGreen
+    }
+}
+
+# ---------- 同步会话历史 ----------
+function Do-Sync {
+    $acc = Get-LiveAccount
+    if (-not $acc) { [void][System.Windows.Forms.MessageBox]::Show("读取不到当前登录账号。", "提示"); return }
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "把会话库里的全部历史会话, 统一归属到当前账号 [$($acc.Nick)] 吗?`n`n· 目的: 让这个账号能看到别的账号留下的会话`n· WorkBuddy 将自动关闭、同步并重启`n· 正在进行的 AI 对话会被中断",
+        "同步会话历史", "OKCancel", "Question", "Button1")
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $btnSwitch.Enabled = $false; $btnSave.Enabled = $false; $btnSync.Enabled = $false; $btnRefresh.Enabled = $false
+    Set-Status "正在同步会话归属 ... (关闭程序 → 改写归属 → 重启, 约十几秒)"
+    $ok = $false
+    try { $ok = Invoke-AutoSync } catch {
+        Set-Status "同步出错: $_" $true
+        $btnSwitch.Enabled = $true; $btnSave.Enabled = $true; $btnRefresh.Enabled = $true
+        return
+    }
+    if ($ok) {
+        Set-Status "同步完成! WorkBuddy 正在启动, 本窗口即将关闭。"
+        Start-Sleep -Seconds 2
+        $form.Close()
+    } else {
+        Set-Status "同步失败: $(Get-LastLogLine)" $true
+        $btnSwitch.Enabled = $true; $btnSave.Enabled = $true; $btnRefresh.Enabled = $true
+        Update-SessionHealth
+    }
+}
+
 # ---------- 事件绑定 ----------
 $btnSwitch.Add_Click({ Do-Switch })
 $btnSave.Add_Click({ Do-Save })
-$btnRefresh.Add_Click({ Refresh-List; Set-Status "已刷新。" })
+$btnSync.Add_Click({ Do-Sync })
+$btnRefresh.Add_Click({ Refresh-List; Update-SessionHealth; Set-Status "已刷新。" })
 $lv.Add_DoubleClick({ Do-Switch })
 
 # ---------- 启动 ----------
 Refresh-List
+Update-SessionHealth
 $verifyResult = $null
 if (Test-Path (Join-Path $ProfRoot "expect.json")) {
     try { $verifyResult = Invoke-Verify } catch {}

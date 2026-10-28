@@ -23,7 +23,7 @@ agent_created: true
 ## 核心约束（必须遵守）
 
 1. **绝不在会话内执行 `-Action switch` / `-Action save` / `-Action runjob`** —— 这些操作会关闭 WorkBuddy，等于杀死当前 AI 会话。执行者只能是用户双击桌面「WorkBuddy账号切换.bat」。
-2. 会话内只允许执行只读操作：`-Action accounts`（账号扫描）、`-Action list`（档案列表）、`-Action selftest`。
+2. 会话内只允许执行只读操作：`-Action accounts`（账号扫描）、`-Action list`（档案列表）、`-Action selftest`、`-Action doctor`、`-Action synccheck`（会话归属只查不改）。`-Action sync` 会关程序，属禁止项。
 3. 档案库 `%USERPROFILE%\.workbuddy-profiles\` 含登录凭证：禁止拷贝、压缩、上传、外发，禁止将其内容展示给任何人。
 4. `pending-job.json` 超过 30 分钟自动作废；作废后重新写一份即可。
 5. 切换会中断当前所有 WorkBuddy 内的 AI 对话，触发前必须告知用户。
@@ -82,23 +82,29 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<APP>\switcher.ps1" -Ac
 2. 提示用户在 WorkBuddy 内**正常退出登录 → 登录另一个账号**（此步必须手动，扫码/验证码均可）。
 3. 再保存第二个账号。此后列表里点谁切谁。
 
-### 会话互通（v3.4 起默认开启，v3.6 自包含化）
+### 会话互通（v3.4 起默认开启，v3.6 自包含化，v3.7 建档即互通）
 
-各账号共享同一份会话历史：切换时**不搬移** `projects` / `sessions` / `workbuddy.db`，只在 WorkBuddy 关闭状态下把会话库 `sessions.user_id` 统一改写成目标账号 uid。
+各账号共享同一份会话历史：**不搬移** `projects` / `sessions` / `workbuddy.db`，只在 WorkBuddy 关闭状态下把会话库 `sessions.user_id` 统一改写成目标账号 uid，并清掉该 uid 目录下的 `sidebar-list-snapshot.json`（否则界面仍读旧缓存）。
 
-**它是切换动作的内建步骤，不是独立功能**，没有单独入口，也不该主动向用户推销成"新功能"：
+**三个触发点**（同一实现 `Sync-SessionAfterProfileChange` / `Invoke-AutoSync`）：
 
 ```
-点切换 → 关程序 → 换档案 → Merge-SessionOwners → 清侧边栏缓存 → 重启
+① 切换：点切换 → 关程序 → 换档案 → 归属归一 → 清缓存 → 重启
+② 建档：点【保存当前登录】→ 关程序 → 存档案 → 归属归一 → 清缓存 → 重启   ← v3.7 补上
+③ 兜底：GUI【同步会话历史】按钮 / -Action sync（命令行 synccheck 只查不改）
 ```
+
+> ①③ 是用户可感知的入口，② 是静默的。向用户解释时**先说"不用管，建档时就并好了"**，不要把一个缺陷修复讲成需要他学的新步骤。
 
 - 开关：核心库 `$ShareConversations`（`$true` 共享 / `$false` 恢复各账号独立）
-- 执行体：`Merge-SessionOwners`，运行时按序探测 Python —— ① WorkBuddy 自带 `~/.workbuddy/binaries/python/versions/*` ② PATH（跳过 WindowsStore 占位符）③ 常见安装目录。**不得再写死带用户名的绝对路径**（换电脑即失效）
+- 执行体：`Merge-SessionOwners [-Check]`，运行时按序探测 Python —— ① WorkBuddy 自带 `~/.workbuddy/binaries/python/versions/*` ② PATH（跳过 WindowsStore 占位符）③ 常见安装目录。**不得再写死带用户名的绝对路径**（换电脑即失效）
 - 兜底：`merge-sessions.py` 丢失时自动用核心库内嵌的 `$MergeSessionPySrc` 生成临时脚本执行，互通不中断
-- 返回值：`@{Ok=..; Reason=..}`。失败时切换**照常完成**，但界面会打黄字警告并写 `SWITCH WARN: conversation merge skipped (<Reason>)` —— 属"登录正常、历史只显示本账号"的降级态，不是切换失败
-- 日志证据：`merge-sessions [uid] via <python路径> (exit=0): moved=N total_for_target=M`
-- 自检：`-Action selftest` 会打「互通组件」和「运行时」两行，任一 `缺失!` 即需修
+- 返回值：`@{Ok; Reason; Moved; Total; Before}`。失败时切换**照常完成**，但界面会打黄字警告并写 `SWITCH WARN: conversation merge skipped (<Reason>)` —— 属"登录正常、历史只显示本账号"的降级态，不是切换失败
+- 运行中保护：`Test-AppRunning` 为真时拒绝改库（库被独占，写了会被回滚），改提示用户跑 `-Action sync`
+- 日志证据：`merge-sessions [uid8] check=False via <python路径> (exit=0): {"ok":true,...,"moved":N,"total":M}`
+- 自检：`-Action selftest` 打「互通组件」「运行时」「归属一致性」三行；`-Action doctor` 另报「会话归属」与库内 uid 分布
 - 切换前会话库索引仍会单独备份到 `backup\<时间戳>\workbuddy.db*`
+- 若用户反馈"**新加的账号看不到历史**"：这是 v3.6 及以前的缺陷（建档不触发归属归一），v3.7 已修。现场判断用 `-Action synccheck`：报 `有 N 条属于别的账号` 即命中，`-Action sync` 一次修好
 - 若用户反馈"切换后看不到历史会话"：先看日志 `merge-sessions` 行是否 `exit=0`；再看 `Reason`（`no-python` / `helper-missing` 属环境问题，可修）；都正常则疑服务端会话列表覆盖（服务端限制，文件层面无解，只能等或退回 `$false`）
 - 若用户反馈"两个账号的会话混在一起了"：这是本功能的设计效果，不是故障；想分开就把开关改成 `$false`
 

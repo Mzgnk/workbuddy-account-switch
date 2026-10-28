@@ -6,7 +6,7 @@
 
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![powershell](https://img.shields.io/badge/PowerShell-5.1%2B-blue)
-![version](https://img.shields.io/badge/version-v3.6-green)
+![version](https://img.shields.io/badge/version-v3.7-green)
 
 ---
 
@@ -116,7 +116,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\switcher.ps1 -Action docto
 
 默认开启：**所有账号共享同一份会话历史**，切到任何账号都能看到全部历史对话并接着聊。
 
-实现方式不是搬数据，而是改标签 —— WorkBuddy 的会话都存在同一个数据库里，每条带「属于哪个账号」的字段，界面按当前账号过滤。切换时把归属统一到目标账号即可，同时清掉侧边栏缓存迫使界面重建。
+实现方式不是搬数据，而是改标签 —— WorkBuddy 的会话都存在同一个数据库里，每条带「属于哪个账号」的字段，界面按当前账号过滤。把归属统一到目标账号即可，同时清掉侧边栏缓存迫使界面重建。
+
+归属统一会在**三个时机**触发，不要求用户额外操作：
+
+| 时机 | 说明 |
+|---|---|
+| 切换账号 | 换档案 → 统一归属 → 清缓存 → 重启 |
+| 保存当前登录（建档） | v3.7 新增。新账号建档当场就并入全部历史，不必再切一次 |
+| 点【同步会话历史】/ `-Action sync` | 兜底修复：手动在 App 里换过账号时使用 |
+
+窗口底部常驻一行「会话归属」状态：绿色表示归属一致（并显示名下条数），红色表示有 N 条属于别的账号、当前账号看不到，此时按钮会亮起，点一下即修。
+
+```powershell
+# 只查（不关程序、不改库）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\switcher.ps1 -Action synccheck
+
+# 修复（会关闭并重启 WorkBuddy）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\switcher.ps1 -Action sync
+```
 
 **关闭方式**：把 `switcher-core.ps1` 里的 `$ShareConversations` 改成 `$false`，恢复各账号独立。
 
@@ -142,6 +160,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\switcher.ps1 -Action docto
 **Q：切换后会话列表只有几条，是不是丢了？**
 
 不是。侧边栏按**工作区**分组，你看到的是当前工作区的会话数。换到别的项目目录才会显示对应工作区的会话。可跑 `-Action verify` 或直接查数据库确认总数。
+
+**Q：刚加的新账号，切过去侧边栏是空的 / 只有它自己的几条？**
+
+v3.7 之前的已知缺陷：归属统一只挂在「切换」动作上，「建档」不触发，于是新账号继承的是上一个账号的标签，界面把会话全过滤掉了（同时还留着一份登录瞬间生成的空侧边栏缓存）。
+
+现在建档时会自动并入。若仍遇到：看图窗底部「会话归属」那一行，红色就点【同步会话历史】，或跑 `-Action synccheck` 查看、`-Action sync` 修复。
 
 **Q：档案为什么这么大（约 84MB）？**
 
@@ -192,6 +216,7 @@ workbuddy-account-switch/
 
 | 版本 | 变更 |
 |---|---|
+| v3.7 | 建档即互通：新账号保存登录态时立即并入历史；新增「会话归属」状态行与【同步会话历史】按钮 / `-Action sync` |
 | v3.6 | 会话互通自包含化：运行时自动探测、源码内嵌兜底、失败不再静默 |
 | v3.5 | 保存时自动清理档案内会话副本；磁盘占用降约 40% |
 | v3.4 | 新增会话互通（跨账号共享历史） |

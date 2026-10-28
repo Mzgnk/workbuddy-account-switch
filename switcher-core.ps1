@@ -96,32 +96,65 @@ $ConvFiles = @("workbuddy.db", "workbuddy.db-wal", "workbuddy.db-shm")
 # 会话互通的执行体(内嵌): 磁盘上有 merge-sessions.py 就用它(便于调试),
 # 没有则用这段源码现场生成 → 互通能力内聚在插件内, 不依赖散落的外部文件
 $MergeSessionPySrc = @'
+import json
 import sqlite3
 import sys
 
 
+def stats(con):
+    rows = con.execute("SELECT user_id, count(*) FROM sessions GROUP BY user_id").fetchall()
+    return {("" if k is None else k): v for k, v in rows}
+
+
 def main() -> int:
-    if len(sys.argv) < 3:
-        print("usage: merge-sessions.py <db> <uid>")
+    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    check = "--check" in sys.argv
+    as_json = "--json" in sys.argv
+    if len(argv) < 2:
+        print("usage: merge-sessions.py <db> <uid> [--check] [--json]")
         return 2
-    db, uid = sys.argv[1], sys.argv[2]
-    con = sqlite3.connect(db, timeout=10)
+    db, uid = argv[0], argv[1]
+
     try:
-        con.execute("PRAGMA busy_timeout = 10000")
-        before = con.execute(
-            "SELECT user_id, count(*) FROM sessions GROUP BY user_id"
-        ).fetchall()
-        cur = con.execute(
-            "UPDATE sessions SET user_id = ? WHERE user_id IS NOT NULL AND user_id <> ?",
-            (uid, uid),
-        )
-        con.commit()
-        total = con.execute(
-            "SELECT count(*) FROM sessions WHERE user_id = ?", (uid,)
-        ).fetchone()[0]
-        print("moved={} total_for_target={} before={}".format(
-            cur.rowcount, total, before))
+        con = sqlite3.connect(db, timeout=10)
+    except sqlite3.Error as e:
+        out = {"ok": False, "reason": "open-failed: {}".format(e)}
+        print(json.dumps(out, ensure_ascii=False) if as_json else out["reason"])
+        return 1
+
+    try:
+        before = stats(con)
+        if check:
+            moved = sum(v for k, v in before.items() if k != uid)
+            total = before.get(uid, 0) + moved
+        else:
+            cur = con.execute(
+                "UPDATE sessions SET user_id = ? "
+                "WHERE user_id IS NULL OR user_id <> ?",
+                (uid, uid),
+            )
+            moved = cur.rowcount
+            con.commit()
+            total = con.execute(
+                "SELECT count(*) FROM sessions WHERE user_id = ?", (uid,)
+            ).fetchone()[0]
+        out = {
+            "ok": True,
+            "check": check,
+            "uid": uid,
+            "moved": moved,
+            "total": total,
+            "before": before,
+        }
+        if as_json:
+            print(json.dumps(out, ensure_ascii=False))
+        else:
+            print("moved={} total_for_target={} before={}".format(moved, total, before))
         return 0
+    except sqlite3.Error as e:
+        out = {"ok": False, "reason": "sql-failed: {}".format(e)}
+        print(json.dumps(out, ensure_ascii=False) if as_json else out["reason"])
+        return 1
     finally:
         con.close()
 
@@ -348,11 +381,18 @@ function Find-PythonExe {
     return $null
 }
 
-function Merge-SessionOwners([string]$Uid) {
-    if (-not $ShareConversations) { return @{ Ok = $true; Reason = "disabled" } }
-    if (-not $Uid) { Write-Log "merge-sessions SKIP: no target uid"; return @{ Ok = $false; Reason = "no-uid" } }
+function Test-AppRunning {
+    # 会话库由 App 独占打开 → 改写归属前必须让程序先退出, 否则写入会被回滚/锁住
+    return [bool](Get-Process -Name "WorkBuddy" -ErrorAction SilentlyContinue)
+}
+
+function Merge-SessionOwners([string]$Uid, [switch]$Check) {
+    # 返回值: Ok / Reason / Moved(本次改归的会话数) / Total(目标账号名下会话数) / Before(改前分布)
+    $res = @{ Ok = $true; Reason = ""; Moved = 0; Total = 0; Before = @{} }
+    if (-not $ShareConversations) { $res.Reason = "disabled"; return $res }
+    if (-not $Uid) { Write-Log "merge-sessions SKIP: no target uid"; $res.Ok = $false; $res.Reason = "no-uid"; return $res }
     $db = Join-Path $WbRoot "workbuddy.db"
-    if (-not (Test-Path $db)) { Write-Log "merge-sessions SKIP: db missing"; return @{ Ok = $false; Reason = "db-missing" } }
+    if (-not (Test-Path $db)) { Write-Log "merge-sessions SKIP: db missing"; $res.Ok = $false; $res.Reason = "db-missing"; return $res }
     $py = Join-Path $PSScriptRoot "merge-sessions.py"
     $tmpPy = $null
     if (-not (Test-Path $py)) {
@@ -364,40 +404,66 @@ function Merge-SessionOwners([string]$Uid) {
             Write-Log "merge-sessions: using embedded helper (side-car file missing)"
         } catch {
             Write-Log "merge-sessions FAIL: cannot materialize embedded helper: $_"
-            return @{ Ok = $false; Reason = "helper-missing" }
+            $res.Ok = $false; $res.Reason = "helper-missing"
+            return $res
         }
     }
     $exe = Find-PythonExe
     if (-not $exe) {
         if ($tmpPy -and (Test-Path $tmpPy)) { Remove-Item $tmpPy -Force -ErrorAction SilentlyContinue }
         Write-Log "merge-sessions FAIL: 本机找不到可用 Python(WorkBuddy 自带与 PATH 均无)"
-        return @{ Ok = $false; Reason = "no-python" }
+        $res.Ok = $false; $res.Reason = "no-python"
+        return $res
     }
+    $pyArgs = @($py, $db, $Uid, "--json")
+    if ($Check) { $pyArgs += "--check" }
     try {
-        $r = & $exe $py $db $Uid 2>&1
+        $out = & $exe @pyArgs 2>&1
         $code = $LASTEXITCODE
-        Write-Log "merge-sessions [$Uid] via $exe (exit=$code): $r"
+        $jline = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim().StartsWith("{") }) | Select-Object -Last 1
+        Write-Log ("merge-sessions [" + (Get-ShortUid $Uid) + "] check=" + [bool]$Check + " via $exe (exit=$code): $jline")
         if ($code -ne 0) {
             Write-Log "merge-sessions FAIL [$Uid]: non-zero exit $code"
-            return @{ Ok = $false; Reason = "exit-$code" }
+            $res.Ok = $false; $res.Reason = "exit-$code"
+            return $res
+        }
+        if ($jline) {
+            try {
+                $j = $jline | ConvertFrom-Json
+                $res.Moved = [int]$j.moved
+                $res.Total = [int]$j.total
+                if ($j.before) {
+                    $b = @{}
+                    foreach ($pp in $j.before.PSObject.Properties) { $b[$pp.Name] = [int]$pp.Value }
+                    $res.Before = $b
+                }
+            } catch { Write-Log "merge-sessions WARN: cannot parse helper output" }
         }
     } catch {
         Write-Log "merge-sessions FAIL [$Uid]: $_"
-        return @{ Ok = $false; Reason = "exec-error" }
+        $res.Ok = $false; $res.Reason = "exec-error"
+        return $res
     } finally {
         if ($tmpPy -and (Test-Path $tmpPy)) { Remove-Item $tmpPy -Force -ErrorAction SilentlyContinue }
     }
+    if ($Check) { $res.Reason = "checked"; return $res }
     # 目标账号目录里有份"侧边栏会话快照"缓存, 只列该账号自己的会话。
     # 清掉它, 界面启动时才会按数据库重建完整列表(原文件改名 .bak 保留)
+    Clear-SidebarSnapshot $Uid
+    $res.Reason = "merged"
+    return $res
+}
+
+function Clear-SidebarSnapshot([string]$Uid) {
+    # 每个账号一份侧边栏缓存(items 为数组)。不清它, 即使库里归属已改好, 界面仍显示旧列表
+    if (-not $Uid) { return }
     $snapFile = Join-Path (Join-Path $WbRoot $Uid) "sidebar-list-snapshot.json"
-    if (Test-Path $snapFile) {
-        try {
-            Copy-Item $snapFile "$snapFile.bak" -Force
-            Remove-Item $snapFile -Force
-            Write-Log "sidebar-snapshot cleared for $Uid (rebuilt from db on next launch)"
-        } catch { Write-Log "sidebar-snapshot clear FAIL: $_" }
-    }
-    return @{ Ok = $true; Reason = "merged" }
+    if (-not (Test-Path $snapFile)) { return }
+    try {
+        Copy-Item $snapFile "$snapFile.bak" -Force
+        Remove-Item $snapFile -Force
+        Write-Log "sidebar-snapshot cleared for $(Get-ShortUid $Uid) (rebuilt from db on next launch)"
+    } catch { Write-Log "sidebar-snapshot clear FAIL: $_" }
 }
 
 function Clean-Name([string]$N) {
@@ -501,8 +567,34 @@ function Invoke-AutoSave([string]$ProfName) {
     Set-CurrentProfile $ProfName
     Write-Log "SAVE OK [$ProfName] account=$($acc.Nick)"
     Write-Host "[OK] 已保存档案 [$ProfName]  账号: $($acc.Nick)" -ForegroundColor Green
+    # 建档即互通(v3.5): 新账号登录后, 库里会话归属仍是上一个账号, 界面按自己 uid 过滤 → 一片空白。
+    # 这里趁程序还关着, 立刻把归属统一到本账号并清掉侧边栏缓存 —— 一步到位, 不必再切一次才通。
+    Sync-SessionAfterProfileChange -Uid $acc.Uid -Stage "SAVE"
     Start-WorkBuddy | Out-Null
     return $true
+}
+
+function Sync-SessionAfterProfileChange([string]$Uid, [string]$Stage) {
+    # 保存档案 / 切换账号 之后的统一收尾: 归属归一 + 侧边栏缓存清理 + 人话反馈
+    if (-not $ShareConversations) { return }
+    if (Test-AppRunning) {
+        Write-Host "[!] WorkBuddy 仍在运行, 跳过会话同步(库被占用)。请关闭程序后运行 -Action sync。" -ForegroundColor Yellow
+        Write-Log "$Stage WARN: app still running, session sync skipped"
+        return
+    }
+    Write-Host ">> 正在把会话历史并入该账号(互通) ..." -ForegroundColor DarkGray
+    $mr = Merge-SessionOwners $Uid
+    if ($mr.Ok) {
+        if ($mr.Moved -gt 0) {
+            Write-Host ("     会话互通完成: 本次并入 {0} 条, 该账号名下共 {1} 条。" -f $mr.Moved, $mr.Total) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("     会话归属已一致: 该账号名下 {0} 条, 无需改动。" -f $mr.Total) -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host ("     [!] 会话互通未执行 ({0})" -f $mr.Reason) -ForegroundColor Yellow
+        Write-Host "         登录不受影响; 但历史会话可能只显示该账号自己的。" -ForegroundColor Yellow
+        Write-Log "$Stage WARN: conversation merge skipped ($($mr.Reason))"
+    }
 }
 
 function Invoke-AutoSwitch([string]$ProfName) {
@@ -568,21 +660,63 @@ function Invoke-AutoSwitch([string]$ProfName) {
     } catch {}
     Write-Log "SWITCH DONE -> [$ProfName] ($nick) uid=$(Get-ShortUid $expectUid) [待验证]"
     Write-Host "[OK] 文件已切换, 正在启动 WorkBuddy ..." -ForegroundColor Green
-    if ($ShareConversations) {
-        Write-Host ">> 正在统一会话归属(会话互通) ..." -ForegroundColor DarkGray
-        $mr = Merge-SessionOwners $expectUid
-        if ($mr.Ok) {
-            Write-Host "     会话互通完成。" -ForegroundColor DarkGray
-        } else {
-            Write-Host "     [!] 会话互通未执行 ($($mr.Reason))" -ForegroundColor Yellow
-            Write-Host "         登录切换不受影响; 但历史会话可能只显示该账号自己的。" -ForegroundColor Yellow
-            Write-Log "SWITCH WARN: conversation merge skipped ($($mr.Reason))"
-        }
-    }
+    Sync-SessionAfterProfileChange -Uid $expectUid -Stage "SWITCH"
     Write-Host "     启动约 10 秒后会自动核对登录账号, 结果写入日志。" -ForegroundColor DarkGray
     Start-WorkBuddy | Out-Null
     $mtx.ReleaseMutex() | Out-Null; $mtx.Dispose()
     return $true
+}
+
+# ============================================================
+#  会话归属修复 (v3.5): 把库里所有会话统一归到"当前登录账号"
+#  用途: 手动在 App 里换过账号(没走插件) / 新账号建档后仍看不到历史
+# ============================================================
+function Invoke-AutoSync([switch]$CheckOnly) {
+    $acc = Get-LiveAccount
+    if (-not $acc) {
+        Write-Log "SYNC FAIL: no live account"
+        Write-Host "[X] 读取不到当前登录账号(可能未登录)" -ForegroundColor Red
+        return $false
+    }
+    if ($CheckOnly) {
+        $r = Merge-SessionOwners $acc.Uid -Check
+        if (-not $r.Ok) { Write-Host "[X] 检查失败: $($r.Reason)" -ForegroundColor Red; return $false }
+        Write-Host ("  当前登录 : {0} (uid={1})" -f $acc.Nick, (Get-ShortUid $acc.Uid))
+        if ($r.Moved -gt 0) {
+            Write-Host ("  [!] 归属不一致: 有 {0} 条会话属于别的账号, 本账号看不到" -f $r.Moved) -ForegroundColor Yellow
+            Write-Host ("      修复: -Action sync (会关闭并重启 WorkBuddy)" ) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("  [OK] 归属一致: 本账号名下 {0} 条会话" -f $r.Total) -ForegroundColor Green
+        }
+        return $true
+    }
+    $mtx = New-Object System.Threading.Mutex($false, "WBSwitcherSwitchLock")
+    if (-not $mtx.WaitOne(0)) {
+        Write-Log "SYNC FAIL: another switch is already running"
+        Write-Host "[X] 已有另一个切换正在执行, 请等它结束后再试。" -ForegroundColor Red
+        return $false
+    }
+    try {
+        if (-not (Close-AppAuto)) {
+            Write-Log "SYNC FAIL: cannot close app"
+            Write-Host "[X] 无法关闭 WorkBuddy" -ForegroundColor Red
+            return $false
+        }
+        Write-Host ">> 正在同步会话归属到 [$($acc.Nick)] ..."
+        $mr = Merge-SessionOwners $acc.Uid
+        if (-not $mr.Ok) {
+            Write-Log "SYNC FAIL: merge reason=$($mr.Reason)"
+            Write-Host "[X] 同步失败: $($mr.Reason)" -ForegroundColor Red
+            Start-WorkBuddy | Out-Null
+            return $false
+        }
+        Write-Host ("[OK] 同步完成: 并入 {0} 条, 名下共 {1} 条" -f $mr.Moved, $mr.Total) -ForegroundColor Green
+        Write-Log "SYNC OK uid=$(Get-ShortUid $acc.Uid) moved=$($mr.Moved) total=$($mr.Total)"
+        Start-WorkBuddy | Out-Null
+        return $true
+    } finally {
+        $mtx.ReleaseMutex() | Out-Null; $mtx.Dispose()
+    }
 }
 
 # ============================================================
@@ -660,6 +794,19 @@ function Invoke-SelfTest {
         Write-Host "  会话互通           : 开启(各账号共享会话历史)"
         Write-Host ("    互通组件         : " + $(if (Test-Path $helper) { "OK (merge-sessions.py)" } else { "缺失! 会话互通将不可用" }))
         Write-Host ("    运行时           : " + $(if ($pyexe) { "OK ($pyexe)" } else { "缺失! 找不到 Python, 会话互通将不可用" }))
+        $acc0 = Get-LiveAccount
+        if ($acc0 -and $pyexe) {
+            $ck = Merge-SessionOwners $acc0.Uid -Check
+            if ($ck.Ok) {
+                if ($ck.Moved -gt 0) {
+                    Write-Host ("    归属一致性       : [!] 有 {0} 条属于别的账号, 本账号看不到 → 用 -Action sync 修复" -f $ck.Moved) -ForegroundColor Yellow
+                } else {
+                    Write-Host ("    归属一致性       : OK (名下 {0} 条, 全部一致)" -f $ck.Total) -ForegroundColor Green
+                }
+            } else {
+                Write-Host ("    归属一致性       : 无法检查 ($($ck.Reason))") -ForegroundColor Yellow
+            }
+        }
     } else {
         Write-Host "  会话互通           : 关闭(各账号独立)"
     }
@@ -682,6 +829,23 @@ function Invoke-Doctor {
     Write-Host ("  当前档案     : " + $(if ($cur) { $cur } else { "(无)" }))
     if ($acc -and $curProfUid -and ($acc.Uid -ne $curProfUid)) {
         Write-Host "  [!] 当前档案记录的账号与实时登录不一致 => 上次切换可能未生效" -ForegroundColor Yellow
+    }
+    # 会话归属(互通)体检: 归属与当前登录不一致 => 侧边栏就看不到老会话
+    if ($ShareConversations -and $acc) {
+        $ck = Merge-SessionOwners $acc.Uid -Check
+        if ($ck.Ok) {
+            if ($ck.Moved -gt 0) {
+                Write-Host ("  会话归属     : [!] {0} 条属于别的账号 => 本账号看不到 (运行 -Action sync 修复)" -f $ck.Moved) -ForegroundColor Yellow
+            } else {
+                Write-Host ("  会话归属     : OK (名下 {0} 条, 归属一致)" -f $ck.Total)
+            }
+            if ($ck.Before.Count -gt 1) {
+                $dist = (@($ck.Before.GetEnumerator()) | Sort-Object Value -Descending | ForEach-Object { "$(Get-ShortUid $_.Key)=$($_.Value)" }) -join "  "
+                Write-Host ("    库内分布   : $dist") -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host ("  会话归属     : 无法检查 ($($ck.Reason))") -ForegroundColor Yellow
+        }
     }
     $ef = Join-Path $ProfRoot "expect.json"
     if (Test-Path $ef) {
