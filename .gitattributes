@@ -1,0 +1,8 @@
+# 统一换行符，避免跨平台 clone 后 .bat / .ps1 执行异常
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.py  text eol=lf
+*.md  text eol=lf

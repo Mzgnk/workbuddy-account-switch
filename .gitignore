@@ -1,0 +1,28 @@
+# 运行时产物（档案、备份、日志）—— 内含登录凭证，绝不入库
+*.bak
+*.bak-*
+*.zip
+*.log
+backup/
+profiles/
+profiles-test/
+
+# 数据库文件
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 测试遗留
+_test*
+_embedded_test.*
