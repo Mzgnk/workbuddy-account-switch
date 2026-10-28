@@ -2,6 +2,8 @@
 
 > 在本机多个 WorkBuddy 账号之间一键切换 —— 不用退出登录，不用重新扫码或输验证码，点一下就换，几秒钟完成。
 
+> **本项目是个人开源的第三方工具，与 WorkBuddy 官方无关，未获官方背书。** 它通过替换本地登录态文件实现切换，属于对第三方软件的外部辅助手段，请阅读文末[安全与风险](#安全与风险)后再决定是否使用。
+
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![powershell](https://img.shields.io/badge/PowerShell-5.1%2B-blue)
 ![version](https://img.shields.io/badge/version-v3.6-green)
@@ -55,8 +57,10 @@ WorkBuddy 桌面版本身不提供账号切换功能，换号必须先退出、�
 1. 把本仓库下载或 clone 到任意目录（下称 `<APP>`），例如：
 
    ```powershell
-   git clone https://github.com/<你的用户名>/workbuddy-account-switch.git "$env:USERPROFILE\workbuddy-account-switch"
+   git clone https://github.com/Mzgnk/workbuddy-account-switch.git "$env:USERPROFILE\workbuddy-account-switch"
    ```
+
+   也可以在仓库页点头部的 **Code → Download ZIP** 直接下载解压（不需要装 git）。
 
 2. 双击 `Run.bat` —— 第一次运行会弹出账号窗口。
 3. （可选）给 `Run.bat` 建个桌面快捷方式，或发送到开始菜单。
